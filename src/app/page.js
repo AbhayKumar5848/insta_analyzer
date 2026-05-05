@@ -69,6 +69,18 @@ export default function Dashboard() {
     loadData();
   }
 
+  async function handleCleanup() {
+    if (!confirm('🧹 Remove all deactivated profiles and profiles with no follower/following data?')) return;
+    try {
+      const res = await fetch('/api/profiles/cleanup', { method: 'POST' });
+      const data = await res.json();
+      alert(`Removed ${data.removed} profiles. ${data.remaining} remaining.`);
+      loadData();
+    } catch (e) {
+      alert('Cleanup failed: ' + e.message);
+    }
+  }
+
   function handleExport() {
     const params = new URLSearchParams();
     Object.entries(filters).forEach(([k, v]) => { if (v) params.set(k, v); });
@@ -88,6 +100,7 @@ export default function Dashboard() {
           <button className="btn btn-accent btn-sm" onClick={() => setShowUpload(!showUpload)}>
             {showUpload ? '✕ Close' : '📁 Upload File'}
           </button>
+          <button className="btn btn-secondary btn-sm" onClick={handleCleanup}>🧹 Clean Up</button>
           <button className="btn btn-danger btn-sm" onClick={handleDeleteAll}>🗑️ Clear All</button>
         </div>
       </header>

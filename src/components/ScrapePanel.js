@@ -5,6 +5,8 @@ import { useEffect, useState, useRef } from 'react';
 export default function ScrapePanel({ onComplete, onRefresh }) {
   const [scraping, setScraping] = useState(false);
   const [progress, setProgress] = useState(null);
+  const [disableWaves, setDisableWaves] = useState(false);
+  const [batchSize, setBatchSize] = useState(25);
   const esRef = useRef(null);
 
   function connectSSE() {
@@ -39,7 +41,11 @@ export default function ScrapePanel({ onComplete, onRefresh }) {
       const res = await fetch('/api/scrape/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ force }),
+        body: JSON.stringify({
+          force,
+          disableWaves,
+          batchSize: batchSize || 25,
+        }),
       });
       const data = await res.json();
       if (data.error) {
@@ -68,14 +74,61 @@ export default function ScrapePanel({ onComplete, onRefresh }) {
     if (onRefresh) onRefresh();
   }
 
+  async function handleResume() {
+    setScraping(true);
+    try {
+      const res = await fetch('/api/scrape/resume', { method: 'POST' });
+      const data = await res.json();
+      if (data.error) {
+        alert(data.error);
+        setScraping(false);
+        return;
+      }
+      connectSSE();
+    } catch (e) {
+      alert('Failed to resume: ' + e.message);
+      setScraping(false);
+    }
+  }
+
   useEffect(() => {
     return () => { if (esRef.current) esRef.current.close(); };
   }, []);
 
   const pct = progress?.total > 0 ? Math.round((progress.completed / progress.total) * 100) : 0;
+  const canResume = progress && !progress.active && progress.completed > 0 && progress.completed < progress.total;
 
   return (
     <div className="scrape-panel">
+      {/* Scrape Options */}
+      <div className="scrape-options">
+        <div className="scrape-option">
+          <label htmlFor="batchSize" className="option-label">Batch Size</label>
+          <input
+            id="batchSize"
+            type="number"
+            min="1"
+            max="500"
+            value={batchSize}
+            onChange={(e) => setBatchSize(Math.max(1, parseInt(e.target.value) || 1))}
+            disabled={scraping}
+            className="option-input"
+          />
+        </div>
+        <div className="scrape-option">
+          <label className="option-label toggle-label">
+            <input
+              type="checkbox"
+              checked={disableWaves}
+              onChange={(e) => setDisableWaves(e.target.checked)}
+              disabled={scraping}
+            />
+            <span className="toggle-text">Disable Waves</span>
+            <span className="toggle-hint">(no cooldown between batches)</span>
+          </label>
+        </div>
+      </div>
+
       {/* Controls */}
       <div className="scrape-controls">
         <button
@@ -85,6 +138,16 @@ export default function ScrapePanel({ onComplete, onRefresh }) {
         >
           {scraping ? '⏳ Scraping...' : '🚀 Start Scraping'}
         </button>
+        {canResume && (
+          <button
+            className="btn btn-primary btn-sm"
+            onClick={handleResume}
+            disabled={scraping}
+            title="Resume scraping from where it stopped"
+          >
+            ▶️ Resume Scraping
+          </button>
+        )}
         <button
           className="btn btn-secondary btn-sm"
           onClick={() => handleStart(true)}
@@ -115,12 +178,17 @@ export default function ScrapePanel({ onComplete, onRefresh }) {
               }
             </h3>
             <span className="scrape-stats">
-              {progress.successes} ✅ / {progress.failures} ❌ / {progress.total} total
+              {progress.successes} ✅ / {progress.failures} ❌ / {(progress.skipped || 0)} ⊘ skipped / {progress.total} total
             </span>
           </div>
 
           <div className="scrape-badges">
-            {progress.wave > 0 && (
+            {progress.disableWaves && (
+              <span className="scrape-badge badge-wave">
+                ⚡ Waves Disabled
+              </span>
+            )}
+            {progress.wave > 0 && !progress.disableWaves && (
               <span className="scrape-badge badge-wave">
                 📦 Wave {progress.wave}/{progress.totalWaves}
               </span>
@@ -130,9 +198,14 @@ export default function ScrapePanel({ onComplete, onRefresh }) {
                 ⏱️ ~{progress.estimatedTimeLeft} left
               </span>
             )}
+            {(progress.skipped || 0) > 0 && (
+              <span className="scrape-badge badge-skip">
+                ⊘ {progress.skipped} deactivated
+              </span>
+            )}
             {progress.consecutiveFailures > 0 && (
               <span className="scrape-badge badge-warn">
-                ⚠️ {progress.consecutiveFailures} consecutive fails
+                ⚠️ {progress.consecutiveFailures} consecutive network fails
               </span>
             )}
           </div>

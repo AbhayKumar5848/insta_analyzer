@@ -10,7 +10,7 @@ const WAVE_SIZE = 25;
 const WAVE_COOLDOWN_MS = 5 * 60 * 1000;       // 5 min between waves
 const DELAY_MIN_MS = 6000;                      // 6s min between requests
 const DELAY_MAX_MS = 15000;                     // 15s max between requests 
-const MAX_CONSECUTIVE_FAILURES = 5;             // Auto-stop threshold
+const MAX_CONSECUTIVE_FAILURES = 10;            // Auto-stop threshold (network errors only)
 const REQUEST_TIMEOUT_MS = 15000;               // 15s per request
 const RATE_LIMIT_BACKOFF_MS = 10 * 60 * 1000;   // 10 min initial backoff
 const MAX_BACKOFF_MS = 40 * 60 * 1000;          // 40 min max backoff
@@ -44,6 +44,7 @@ const defaultState = {
   total: 0,
   successes: 0,
   failures: 0,
+  skipped: 0,          // deactivated / deleted accounts skipped
   consecutiveFailures: 0,
   currentUsername: '',
   wave: 0,
@@ -53,6 +54,8 @@ const defaultState = {
   stoppedReason: '',
   startedAt: null,
   estimatedTimeLeft: '',
+  disableWaves: false,
+  waveSize: WAVE_SIZE,
 };
 
 if (!globalThis.__igScraper) {
@@ -71,12 +74,15 @@ export function getProgress() {
   return { ...scraper.state };
 }
 
-export function startScraping(usernamesToScrape) {
+export function startScraping(usernamesToScrape, options = {}) {
   if (scraper.state.active) {
     return { error: 'Scraping already in progress' };
   }
 
-  const totalWaves = Math.ceil(usernamesToScrape.length / WAVE_SIZE);
+  const disableWaves = options.disableWaves || false;
+  const waveSize = options.batchSize || WAVE_SIZE;
+  const effectiveWaveSize = disableWaves ? usernamesToScrape.length : waveSize;
+  const totalWaves = disableWaves ? 1 : Math.ceil(usernamesToScrape.length / waveSize);
 
   scraper.state = {
     ...defaultState,
@@ -86,10 +92,12 @@ export function startScraping(usernamesToScrape) {
     total: usernamesToScrape.length,
     totalWaves,
     startedAt: new Date().toISOString(),
+    disableWaves,
+    waveSize: effectiveWaveSize,
   };
   scraper.aborted = false;
 
-  console.log(`[Scraper] Starting: ${usernamesToScrape.length} profiles in ${totalWaves} waves`);
+  console.log(`[Scraper] Starting: ${usernamesToScrape.length} profiles, batch=${effectiveWaveSize}, waves=${disableWaves ? 'DISABLED' : totalWaves}`);
   
   // Begin async processing
   processNextWave();
@@ -141,8 +149,9 @@ async function processNextWave() {
   scraper.state.paused = false;
   scraper.state.pauseReason = '';
   
+  const currentWaveSize = scraper.state.waveSize || WAVE_SIZE;
   const waveStart = scraper.state.queueIndex;
-  const waveEnd = Math.min(waveStart + WAVE_SIZE, scraper.state.queue.length);
+  const waveEnd = Math.min(waveStart + currentWaveSize, scraper.state.queue.length);
 
   console.log(`[Scraper] Wave ${scraper.state.wave}/${scraper.state.totalWaves} — profiles ${waveStart + 1}–${waveEnd}`);
 
@@ -153,35 +162,59 @@ async function processNextWave() {
     scraper.state.currentUsername = username;
     scraper.state.queueIndex = i + 1;
 
+    // ── Skip __deleted__ accounts without making a network request ──
+    if (username.startsWith('__deleted__')) {
+      scraper.state.skipped++;
+      scraper.state.completed++;
+      saveDeactivatedProfile(username, 'deleted_account');
+      console.log(`[Scraper] ⊘ @${username}: Deleted account — skipped`);
+      updateETA();
+      saveScrapeProgress();
+      continue; // No delay needed, no request was made
+    }
+
     // Scrape the profile
     const result = await scrapeOneProfile(username);
 
     if (result.error) {
-      scraper.state.failures++;
-      scraper.state.consecutiveFailures++;
-      console.log(`[Scraper] ✗ @${username}: ${result.error} (${scraper.state.consecutiveFailures} consecutive failures)`);
+      // ── Classify the error ──
+      const ACCOUNT_ERRORS = ['not_found', 'no_data'];  // Account is gone/deactivated
+      const isAccountError = ACCOUNT_ERRORS.includes(result.error);
 
-      // ── AUTO-STOP: too many consecutive failures ──
-      if (scraper.state.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-        stopScraping(`Auto-stopped: ${MAX_CONSECUTIVE_FAILURES} consecutive failures — Instagram may be blocking requests. Try again later.`);
-        return;
-      }
+      if (isAccountError) {
+        // Account-level issue: skip gracefully, do NOT count toward auto-stop
+        scraper.state.skipped++;
+        saveDeactivatedProfile(username, result.error);
+        console.log(`[Scraper] ⊘ @${username}: ${result.error} — deactivated/unavailable, skipping`);
+        scraper.state.consecutiveFailures = 0; // Reset — this isn't a blocking issue
+      } else {
+        // Network/blocking error: count toward auto-stop
+        scraper.state.failures++;
+        scraper.state.consecutiveFailures++;
+        console.log(`[Scraper] ✗ @${username}: ${result.error} (${scraper.state.consecutiveFailures} consecutive network failures)`);
 
-      // ── Rate limit: exponential backoff ──
-      if (result.error === 'rate_limited') {
-        const backoffMs = Math.min(
-          RATE_LIMIT_BACKOFF_MS * Math.pow(2, scraper.state.consecutiveFailures - 1),
-          MAX_BACKOFF_MS
-        );
-        const backoffMin = Math.round(backoffMs / 60000);
-        scraper.state.paused = true;
-        scraper.state.pauseReason = `Rate limited — backing off ${backoffMin} minutes`;
-        console.log(`[Scraper] Rate limited — backing off ${backoffMin} minutes`);
-        
-        await sleep(backoffMs);
-        
-        if (scraper.aborted) return;
-        scraper.state.paused = false;
+        // ── AUTO-STOP: too many consecutive network failures ──
+        if (scraper.state.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+          stopScraping(`Auto-stopped: ${MAX_CONSECUTIVE_FAILURES} consecutive network failures — Instagram may be blocking requests. Try again later.`);
+          return;
+        }
+
+        // ── Rate limit: exponential backoff ──
+        if (result.error === 'rate_limited') {
+          const backoffMs = Math.min(
+            RATE_LIMIT_BACKOFF_MS * Math.pow(2, scraper.state.consecutiveFailures - 1),
+            MAX_BACKOFF_MS
+          );
+          const backoffMin = Math.round(backoffMs / 60000);
+          scraper.state.paused = true;
+          scraper.state.pauseReason = `Rate limited — backing off ${backoffMin} minutes`;
+          console.log(`[Scraper] Rate limited — backing off ${backoffMin} minutes`);
+          
+          await sleep(backoffMs);
+          
+          if (scraper.aborted) return;
+          scraper.state.paused = false;
+        }
       }
     } else {
       scraper.state.successes++;
@@ -222,17 +255,23 @@ async function processNextWave() {
     return;
   }
 
-  // Wave cooldown
+  // Wave cooldown (skip if waves are disabled)
   if (!scraper.aborted && scraper.state.active) {
-    const cooldownMin = Math.round(WAVE_COOLDOWN_MS / 60000);
-    scraper.state.paused = true;
-    scraper.state.pauseReason = `Wave ${scraper.state.wave} complete — cooling down ${cooldownMin} minutes`;
-    console.log(`[Scraper] Cooling down ${cooldownMin} minutes before next wave...`);
-    
-    scraper.timeoutId = setTimeout(() => {
-      scraper.timeoutId = null;
-      if (!scraper.aborted) processNextWave();
-    }, WAVE_COOLDOWN_MS);
+    if (scraper.state.disableWaves) {
+      // No cooldown — jump straight to the next batch
+      console.log(`[Scraper] Waves disabled — continuing immediately`);
+      processNextWave();
+    } else {
+      const cooldownMin = Math.round(WAVE_COOLDOWN_MS / 60000);
+      scraper.state.paused = true;
+      scraper.state.pauseReason = `Wave ${scraper.state.wave} complete — cooling down ${cooldownMin} minutes`;
+      console.log(`[Scraper] Cooling down ${cooldownMin} minutes before next wave...`);
+      
+      scraper.timeoutId = setTimeout(() => {
+        scraper.timeoutId = null;
+        if (!scraper.aborted) processNextWave();
+      }, WAVE_COOLDOWN_MS);
+    }
   }
 }
 
@@ -245,19 +284,25 @@ async function scrapeOneProfile(username) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
+    const headers = {
+      'User-Agent': randomUA(),
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Cache-Control': 'no-cache',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Sec-Fetch-User': '?1',
+      'Upgrade-Insecure-Requests': '1',
+    };
+
+    if (process.env.IG_SESSIONID) {
+      headers['Cookie'] = `sessionid=${process.env.IG_SESSIONID};`;
+    }
+
     const res = await fetch(url, {
-      headers: {
-        'User-Agent': randomUA(),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Cache-Control': 'no-cache',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Sec-Fetch-User': '?1',
-        'Upgrade-Insecure-Requests': '1',
-      },
+      headers,
       signal: controller.signal,
       redirect: 'follow',
     });
@@ -286,7 +331,19 @@ async function scrapeOneProfile(username) {
     const ogTitle = html.match(/<meta\s+(?:property|name)="og:title"\s+content="([^"]*?)"/i);
     const ogImage = html.match(/<meta\s+(?:property|name)="og:image"\s+content="([^"]*?)"/i);
 
-    const description = ogDesc?.[1] || metaDesc?.[1] || '';
+    const description = decodeHTMLEntities(ogDesc?.[1] || metaDesc?.[1] || '');
+
+    // ── Detect Instagram blocking ──
+    // When blocked, og:title becomes just "Instagram" or the page is a generic login wall
+    const rawTitle = ogTitle?.[1] || '';
+    const isBlockedPage =
+      rawTitle.toLowerCase() === 'instagram' ||
+      (rawTitle.includes('Instagram photos and videos') && !description.match(/Followers/i));
+    
+    if (isBlockedPage) {
+      console.log(`[Scraper] ⚠ @${username}: Instagram returned generic page (blocked)`);
+      return { error: 'rate_limited' };
+    }
 
     if (!description) {
       // Page loaded but no meta data — might be a private profile or login wall
@@ -336,11 +393,30 @@ async function scrapeOneProfile(username) {
 
 // ── Helpers ──
 
+// Decode HTML entities (&#x2708; &#xfe0f; &amp; &lt; &gt; &quot; etc.)
+function decodeHTMLEntities(str) {
+  if (!str) return '';
+  return str
+    // Hex entities: &#x2708; &#xfe0f; &#x1f9a6;
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    // Decimal entities: &#9992;
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)))
+    // Named entities
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&nbsp;/g, ' ');
+}
+
 function extractFullName(ogTitle, username) {
   if (!ogTitle) return '';
+  // Decode HTML entities first
+  const decoded = decodeHTMLEntities(ogTitle);
   // Format: "Full Name (@username) • Instagram photos and videos"
-  const match = ogTitle.match(/^(.+?)\s*\(@/);
-  return match ? match[1].trim() : ogTitle.split('•')[0].split('(')[0].trim();
+  const match = decoded.match(/^(.+?)\s*\(@/);
+  return match ? match[1].trim() : decoded.split('•')[0].split('(')[0].trim();
 }
 
 function parseCount(str) {
@@ -370,8 +446,10 @@ function updateETA() {
   const avgPerProfile = elapsed / s.completed;
   const remaining = s.total - s.completed;
   // Account for wave cooldowns
-  const remainingWaves = Math.ceil(remaining / WAVE_SIZE);
-  const etaMs = (remaining * avgPerProfile) + (remainingWaves * WAVE_COOLDOWN_MS);
+  const currentWaveSize = s.waveSize || WAVE_SIZE;
+  const remainingWaves = Math.ceil(remaining / currentWaveSize);
+  const waveCooldown = s.disableWaves ? 0 : WAVE_COOLDOWN_MS;
+  const etaMs = (remaining * avgPerProfile) + (remainingWaves * waveCooldown);
   
   if (etaMs > 3600000) {
     s.estimatedTimeLeft = `${(etaMs / 3600000).toFixed(1)} hours`;
@@ -383,6 +461,29 @@ function updateETA() {
 }
 
 function saveScrapeProgress() {
-  const { queue, queueIndex, completed, successes, failures, wave, totalWaves, startedAt } = scraper.state;
-  writeScrapeState({ queue, queueIndex, completed, successes, failures, wave, totalWaves, startedAt });
+  const { queue, queueIndex, completed, successes, failures, skipped, wave, totalWaves, startedAt } = scraper.state;
+  writeScrapeState({ queue, queueIndex, completed, successes, failures, skipped, wave, totalWaves, startedAt });
+}
+
+// ── Save deactivated/deleted account to profiles ──
+function saveDeactivatedProfile(username, reason) {
+  try {
+    const profiles = readProfiles();
+    const idx = profiles.findIndex(p => p.username === username);
+    if (idx >= 0) {
+      profiles[idx] = {
+        ...profiles[idx],
+        status: 'deactivated',
+        deactivatedReason: reason,
+        followersCount: -1,
+        followingCount: -1,
+        postsCount: -1,
+        lastScrapedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      writeProfiles(profiles);
+    }
+  } catch (e) {
+    console.error(`[Scraper] Error saving deactivated profile @${username}:`, e.message);
+  }
 }
